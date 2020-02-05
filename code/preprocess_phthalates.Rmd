@@ -1,0 +1,521 @@
+---
+title: "Prenatal phthalate exposure and cord blood: an EWAS"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(include=TRUE,fig.align="center",fig.width=7,echo=TRUE)
+```
+
+## Libraries
+
+```{r}
+library(data.table)
+library(stringi)
+library(magrittr)
+library(car)
+library(purrr)
+library(CpGFilter)
+devtools::install_github("hhhh5/ewastools@v1.5")
+library(ewastools)
+library(ggplot2)
+library(ggthemes)
+library(ggman)
+library(latex2exp)
+library(lemon)
+library(rlang)
+library(skimr)
+library(sensitivitymv)
+```
+
+## Data sources
+
+```{r}
+meta = "~/Jdrive/PM/Just_Lab/projects/PROGRESS_lead_850k/data/metadata_2018-01-09.rds"
+prgs = "~/Jdrive/PM/Just_Lab/projects/EWAS_Phthalates/data/MM_JonathanH_Feb28_2019.csv"
+consent = "~/Jdrive/PM/Just_Lab/projects/PROGRESS_kid_850k/data/MM_850K_Consent_May13_2019.csv"
+```
+
+## Covariates
+
+```{r}
+prgs %<>% fread
+phth = copy(prgs)
+
+prgs = prgs[,.(
+   folio           = as.integer(folio)
+  ,sex             = factor(sexo_h00,levels=c(1,2),labels=c("male","female"))
+  ,maternal_age    = mom_age00 # mom_age2T # mom_age3T
+  ,maternal_BMI    = mother_bmi2T # mother_bmi3T 
+  # ,parity          = ifelse(v682T==1,1L,v692T) 
+  ,birth_weight    = v11400
+  ,education       = factor(educ_3cat2T,levels=1:3,labels=c("< high school","high school","> high school"),ordered=TRUE)
+  ,gestational_age = gestage_comb00 # gest_age_weeks2T # gest_age_weeks3T  
+  # ,first_pregnancy = factor(v682T,levels=1:2,labels=c("yes","no"))
+  ,fenton_score    = Fenton_Z_score00
+  ,fenton_q        = Fenton_Percentile00
+  ,cpg             = runif(.N) # dummy variable for methylation levels
+  # ,cbc_basoC00
+  # ,cbc_eosiC00
+  # ,cbc_granuC00
+  # ,cbc_linfoC00
+  # ,cbc_monoC00
+  # ,cbc_neutC00
+  # ,fecha_control2T
+  # ,fecha_control00
+  # ,fecha_control3T
+  # ,fechanac_M2T
+  # ,t212T
+  # ,v792T
+  # ,v793T
+  # ,v802T
+  # ,v8000
+  # ,v803T
+  # ,v12100
+  # ,c_section00
+  )]
+
+prgs %<>% na.omit
+
+consent %<>% fread
+consent = consent[,.(folio,genotyping=genotipifi)]
+
+## manually set genotyping to 1 for those that reconsented
+# 1 = I AM AUTHORIZING GENOTYPE OF GENES
+# 2 = I AM NOT AUTHORIZING GENOTYPE OF GENES 
+consent[folio %in% c(62,320,337,428,567,640,694),genotyping:=1]
+
+prgs = merge(prgs,consent,all.x=TRUE,by="folio"); rm(consent)
+prgs = prgs[genotyping==1]
+prgs$genotyping = NULL
+```
+
+## Technical variables
+
+```{r}
+meta %<>% readRDS
+meta = meta[tissue=="C" & QCpassed==TRUE]
+
+meta[,plate := factor(plate)]
+meta[,row   := well %>% stri_sub(1, 1) %>% match(LETTERS)]
+meta[,chip  := well %>% stri_sub(2,-1) %>% as.integer]
+meta$well = NULL
+
+prgs = merge(prgs,meta[,.(folio,plate,chip,row,file)],by="folio")
+prgs[,file:=stri_replace(file,fixed="../",replacement="~/Jdrive/PM/Just_Lab/projects/PROGRESS_kid_850k/")]
+```
+
+## Throw out technical replicates
+
+```{r}
+prgs = prgs[order(plate,chip,row)]
+prgs[,g:=1:.N,by=folio]
+prgs = prgs[g==1]
+prgs$g = NULL
+```
+
+## DNA methylation
+
+```{r}
+beta = prgs$file %>% read_idats(quiet=TRUE) %>% detectionP %>% mask(0.01) %>% dont_normalize
+prgs[,j:=1:.N]
+```
+
+## Which cord blood reference dataset should be used?
+
+```
+        Bakulski Bakulski+deGoede  Bakulski+Gervin     Bakulski+Lin    Bakulski+Mill 
+       0.4628911        0.4577302        0.4535697        0.4588753        0.4536851 
+Bakulski+Reinius   Bakulski+Salas          deGoede      deGoede+Lin     deGoede+Mill 
+       0.4711592        0.4697039        0.4522785        0.4527813        0.4490379 
+ deGoede+Reinius    deGoede+Salas           Gervin   Gervin+deGoede       Gervin+Lin 
+       0.4541223        0.4574812        0.3573102        0.4488004        0.3523380 
+     Gervin+Mill   Gervin+Reinius     Gervin+Salas              Lin         Lin+Mill 
+       0.3380334        0.3599063        0.3553363        0.3560314        0.3545503 
+     Lin+Reinius        Lin+Salas          Lolipop             Mill          Reinius 
+       0.3613197        0.3579798        0.2839332        0.2928786        0.3666355 
+    Reinius+Mill    Reinius+Salas            Salas       Salas+Mill 
+       0.3517012        0.3563457        0.3485393        0.3486833
+```
+
+
+```{r fig.width=4,fig.height=5.5}
+rsq = c(
+ "Bakulski"         = 0.4628911
+,"Bakulski+Reinius" = 0.4711592
+,"deGoede+Reinius"  = 0.4541223
+,"Gervin+Mill"      = 0.3380334
+,"Lin+Reinius"      = 0.3613197
+,"Reinius+Mill"     = 0.3517012
+,"Bakulski+deGoede" = 0.4577302
+,"Bakulski+Salas"   = 0.4697039
+,"deGoede+Salas"    = 0.4574812
+,"Gervin+Reinius"   = 0.3599063
+,"Lin+Salas"        = 0.3579798
+,"Reinius+Salas"    = 0.3563457
+,"Bakulski+Gervin"  = 0.4535697
+,"deGoede"          = 0.4522785
+,"Gervin"           = 0.3573102
+,"Gervin+Salas"     = 0.3553363
+,"Salas"            = 0.3485393
+,"Bakulski+Lin"     = 0.4588753
+,"deGoede+Lin"      = 0.4527813
+,"Gervin+deGoede"   = 0.4488004
+,"Lin"              = 0.3560314
+,"Mill"             = 0.2928786
+,"Salas+Mill"       = 0.3486833
+,"Bakulski+Mill"    = 0.4536851
+,"deGoede+Mill"     = 0.4490379
+,"Gervin+Lin"       = 0.3523380
+,"Lin+Mill"         = 0.3545503
+,"Reinius"          = 0.3666355
+)
+
+rsq = sort(rsq)
+rsq = data.table(ref=names(rsq),rsq=rsq)
+rsq[,n:=1:.N]
+
+p = ( ggplot(data=rsq,aes(x=reorder(ref,n),y=rsq))
++ geom_col(fill="#004488",color="#004488")
++ coord_flip()
++ xlab(NULL)
++ ylab(TeX("Average $R^2$"))
++ theme_few()
+)
+
+p
+```
+## Estimate leukocyte composition
+
+```{r "leukocyte composition"}
+LC = estimateLC(beta,ref="Bakulski+Reinius")
+prgs = cbind(prgs,LC); rm(LC)
+```
+
+### Main formula
+
+```{r}
+frml = formula(cpg~sex+gestational_age+fenton_score+B+CD4+CD8+MO+GR+NK+nRBC+plate+row)
+```
+
+### Influential samples
+
+* Run for each CpG a regression, rank samples by Cook's distance, and determine for each sample the average rank across all CpGs.
+* A high rank might indicate problematic samples (e.g. a sex mismatch would have a larger influence on regression coefficients than a correctly classified sample)
+* Samples to the right of the red line were excluded.
+
+
+```{r "Influential samples"}
+I = beta %>% is.na %>% apply(1,any) %>% not %>% which
+
+m = lm(frml,prgs)
+mm = model.matrix(m)
+
+f = function(meth){
+  m[1:8] = lm.fit(mm,meth)
+  cooks.distance(m)
+}
+
+infl = apply(beta[I,],1,f)
+prgs$infl = rowMeans(infl)
+prgs[,exclude:=infl > (4/.N)]
+rm(infl,m,mm)
+```
+
+```{r}
+stripchart(prgs$infl,xlab="Average Cook's distance",main="Influence across all probes",m="j",pch=4)
+abline(v=4/nrow(prgs),lty=3,col=2)
+```
+
+```{r}
+prgs = prgs[exclude==FALSE]
+```
+
+## Phthalate metabolites
+
+* If a measurement is below the LOD, the Comments2T/Comments3T variable is set to the LOD, but the original measurement has been kept. If for a particular metabolite no measurement was below the LOD, there is no Comments2T/Comments3T variable. Instead, use enter them here again manually
+* Not sure about MCOCH, derived the sum formula myself.
+
+```{r}
+metabolites = data.table(
+   metabolite=c("mECPP","mEHHP","mEOHP","mEHP" ,"mCPP" ,"mBP" ,"MHBP","miBP","MHiBP"  ,"mBzP2","mEP2" ,"MONP","mCOP" ,"mCNP","MCOCH","MHiNCH","MECPTP")
+  ,mol_weight=c(308.33 ,294.347,292.331,278.348,252.222,222.24,238.24,222.24,237.231+1,256.257,194.186,306.35,322.353,336.38,328.40 ,314.422 ,308.33  )
+  ,lod       =c(.4     ,.4     ,.2     ,.8     ,.4     ,.4    ,.4    ,.8    ,.4       ,.3     ,1.2    ,.4    ,.3     ,.2    ,.5     ,.4      ,.2      )
+  ,parent    =c("DEHP" ,"DEHP" ,"DEHP" ,"DEHP" ,"DOP"  ,"DnBP","DnBP","DiBP","DiBP"   ,"BBzP" ,"DEP"  ,"DiNP","DiNP" ,"DiDP","DINCH","DINCH" ,"DEHTP" ) 
+  )
+
+parents = data.table(
+   parent    =c("DEHTP","DnBP" ,"DiBP" ,"DiNP" ,"BBzP" ,"DiDP" ,"DOP"  ,"DEHP" ,"DEP"  )
+  ,mol_weight=c(390.564,278.348,278.348,418.618,312.365,446.672,390.564,390.564,222.089)
+)
+
+#----------------------------------------------
+### Gather the variable names
+subj = "folio"
+
+V = list()
+V$grav = c("SG_imp2T","SG_imp3T")
+V$grav_imp = c("SG_indic2T","SG_indic3T")
+V$conc = c(metabolites$metabolite %s+% "_Conc_ngml2T",metabolites$metabolite %s+% "_Conc_ngml3T")
+V$name = c(metabolites$metabolite %s+% "_Name2T",metabolites$metabolite %s+% "_Name3T")
+V$date = c(metabolites$metabolite %s+% "_Date2T",metabolites$metabolite %s+% "_Date3T")
+
+#----------------------------------------------
+### Melt the data
+D = imap(V,function(vars,group){ phth[,c(subj,vars),with=FALSE] %>% melt(id.vars=subj,value.name=group) })
+
+### Extract the metabolite names
+(D$conc)[,metabolite:=stri_match(variable,regex="^([:alnum:]+)_")[,2]]
+(D$name)[,metabolite:=stri_match(variable,regex="^([:alnum:]+)_")[,2]]
+(D$date)[,metabolite:=stri_match(variable,regex="^([:alnum:]+)_")[,2]]
+
+### Extract the time point and drop the variable `variable`
+D %<>% map( ~ {.x[,timepoint:=stri_sub(variable,-2,-1)]})
+D %<>% map( ~ {.x[,variable:=NULL]})
+
+conc = reduce(list(D$name,D$conc,D$date),merge,by=c("folio","timepoint","metabolite"))
+
+### Drop participants without any measurements
+conc %<>% na.omit
+
+### Add the limits of detection
+conc %<>% merge(metabolites,by="metabolite",all=TRUE)
+
+grav = merge(D$grav,D$grav_imp,by=c(subj,"timepoint"),all=TRUE)
+conc = merge(conc,grav,by=c(subj,"timepoint"),all.x=TRUE)
+
+rm(D)
+
+### A large fraction of MCOCH and MHiNCH are zero, drop those metabolites
+table(conc[conc==0]$metabolite)
+conc = conc[!metabolite %in% c("MCOCH","MHiNCH")]
+
+conc[,E:=conc]
+
+# Hauser's transformation : phthalates* ((SG_median - 1 )/(SG_sample - 1 ))
+# Hauser et al 2004
+conc[,E:=E*((1.016-1)/(grav-1))]
+
+conc[,E:=E*(1/mol_weight)] ## molar amounts
+
+conc = conc[,.(E=sum(E)),by=.(folio,timepoint,parent)] ## sum all metabolite molar amounts of the same parents
+conc = conc[folio %in% prgs$folio]
+
+gmean = function(x) exp(mean(log(x)))
+phth = dcast(conc,folio+parent~.,value.var="E",fun=gmean) ## geometric mean of both timepoints
+setnames(phth,".","E")
+```
+
+<!--
+conc = conc[,.(E=sum(E)),by=.(folio,timepoint,parent)] ## sum all metabolite molar amounts of the same parents
+phth = phth[,.(E=exp(mean(log(E)))),by=.(folio,parent)] ## geometric mean of both timepoints
+
+phth %<>% merge(parents,by="parent")
+phth = phth[folio %in% prgs$folio]
+
+--!>
+
+```{r fig.height=5,fig.width=5}
+( ggplot(phth)
++ geom_boxplot(aes(x=reorder(parent,E,FUN=median),y=E),color="#004488")
++ ylab(TeX("Molar concentration in $\\mu mol/L$"))
++ xlab(NULL)
++ theme_few()
+)
+
+phth %<>% dcast(folio ~ parent,value.var="E")
+```
+
+
+```{r}
+exposures = c("BBzP","DEHP","DEP","DiBP","DnBP")
+
+prgs = merge(prgs,phth[,c(subj,exposures),with=FALSE],by="folio")
+phth[folio==639,BBzP:=NA]
+phth[folio==347,DnBP:=NA]
+# prgs = prgs[order(j)] ## retain the same order as `beta`
+```
+
+### Correlation between the phthalate levels
+```{r echo=TRUE}
+prgs[,..exposures] %>% cor(use="p",m="kendall") %>% round(2)
+```
+
+```{r "save intermediate data"}
+snp_probes = which(rownames(beta) %like% "^rs")
+beta = beta[-snp_probes,prgs$j]
+prgs[,j:=1:.N]
+
+environment(frml) = NULL # without this step frml will include copy of all variables in its environment
+save(beta,prgs,frml,exposures,file="~/Jdrive/PM/Just_Lab/projects/EWAS_Phthalates/intermediate/transfer_phth.Rdata")
+# upload to Minerva /sc/hydra/scratch/heissj01/phth
+```
+
+## Population characteristics
+
+```{r}
+skim(prgs[,.(
+   sex
+  ,maternal_age
+  ,maternal_BMI
+  ,birth_weight
+  ,education
+  ,gestational_age
+  ,fenton_score
+  ,fenton_q
+  ,BBzP,DEHP,DEP,DiBP,DnBP
+  )])
+```
+
+### Variance inflaction factors
+```{r}
+vifs = sapply(exposures,function(PHTH){
+  lm(update(frml,"~.+"%s+%PHTH),data=prgs) %>% vif %>% extract(PHTH,1)
+})
+
+data.table(PHTH=exposures,GVIF=vifs)
+```
+
+```{r}
+pvals = readRDS("~/Jdrive/PM/Just_Lab/projects/EWAS_Phthalates/intermediate/pvals_phth.rds")
+
+lambdas = sapply(pvals,function(p){
+	p = sort(p,decreasing=TRUE)
+	p = na.omit(p)
+	chisq = qchisq(1-p,df=1)
+	median(chisq)/qchisq(0.5,1)
+})
+
+round(lambdas,2)
+```
+
+```{r, fig.width=5,fig.height=8}
+pvals %<>% as.data.table
+pvals$probe_id = rownames(beta)
+pvals %<>% melt(id.vars="probe_id",value.name="pval",variable.name="phthalate")
+pvals[,phthalate:=factor(phthalate,levels=c("BBzP","DEP","DiBP","DnBP","DEHP"))]
+pvals %<>% na.omit
+
+( ggplot(pvals)
++ geom_histogram(aes(x=pval),breaks=seq(0,1,0.02),fill="#004488",color="#004488")
++ facet_wrap(vars(phthalate),nrow=3,ncol=2)
++ xlab("p-value") + ylab("Frequency")
++ theme_few()
+)
+
+```
+
+## Combine evidence using the truncated product method
+
+```{r fig.width=10,height=4}
+markers = pvals[,.(pval = truncatedP(pval,trunc=0.01)),keyby=probe_id]
+markers = merge(markers,ewastools:::manifest_epic[,.(probe_id,chr,mapinfo)],by="probe_id")
+
+p = ggman(markers,snp="probe_id",bp="mapinfo",chrom="chr",pvalue="pval")
+p
+```
+
+```{r}
+# markers[,pval:=p.adjust(pval,m="bon")]
+markers[,adj.pval:=p.adjust(pval,m="fdr")]
+markers = markers[adj.pval<0.01]
+markers
+```
+
+## Restrict to CpG sites within 10,000bp
+
+```{r}
+markers = markers[order(chr,mapinfo)]
+markers[,dist_next:=shift(mapinfo,type="lead")-mapinfo]
+markers[,dist_prev:=shift(mapinfo,type="lag" )-mapinfo]
+markers[dist_prev %between% c(-10000,0) | dist_next %between% c(0,10000)]
+```
+
+
+```{r, fig.width=5,fig.height=8}
+ADM5 = ewastools:::manifest_epic[chr=="19" & mapinfo %between% c(50192966-5000,50194120+5000)]$probe_id
+ADM5 %<>% CJ(probe_id=.,phthalate=exposures)
+ADM5[,phthalate:=factor(phthalate,levels=c("BBzP","DEP","DiBP","DnBP","DEHP"))]
+
+# Consistent direction of effect
+library(robustbase)
+set.seed(1220399177L)
+SEED = .Random.seed
+
+tmp = pmap(ADM5,function(probe_id,phthalate,...){
+  frml = update(frml,paste0("~.+",phthalate))
+  prgs$cpg = beta[probe_id,]
+  m = lmrob(frml,prgs,control=lmrob.control(refine.tol=1e-4,setting="KS2014",seed=SEED))
+  coef(summary(m))[as.character(phthalate),]
+}) %>% do.call("rbind",.)
+
+colnames(tmp) = c("effect","stderror","t-stat","pval")
+ADM5 = cbind(ADM5,tmp[,c("effect","pval")])
+
+ADM5 = merge(ADM5,ewastools:::manifest_epic[,.(probe_id,chr,mapinfo)],by="probe_id")
+ADM5 = ADM5[order(mapinfo,phthalate)]
+tmp = rbind(ADM5,ADM5[,.(phthalate="Combined",pval=truncatedP(pval,trunc=0.01)),by=.(probe_id,chr,mapinfo)],fill=TRUE)
+
+tmp[,fill:=ifelse(probe_id%in%markers$probe_id,"B","A")]
+
+p = ( ggplot(tmp)
++ geom_rect(aes(xmin=50191942,xmax=50194247,ymin=-Inf,ymax=Inf),fill="gray")
++ geom_line (aes(x=mapinfo,y=-log10(pval)),color="#004488")
++ geom_point(aes(x=mapinfo,y=-log10(pval),fill=fill),color="#004488",shape=21)
++ scale_fill_manual(values = c("A" = "#004488", "B" = "#FFFFFF"),guide=FALSE)
++ xlab("Genomic coordinates")
++ ylab(expression("-log"[10]*" p-value"))
++ facet_wrap(vars(phthalate),nrow=3,ncol=2)
++ theme_few()
++ theme(axis.text.x = element_text(angle = 30, hjust = 1))
+)
+
+p
+
+# markers2 = pvals[,.(probe_id,pval,phthalate)]
+#markers2 = merge(markers2,ewastools:::manifest_epic[,.(probe_id,chr,mapinfo)],by="probe_id")
+#markers2 = markers2[probe_id%in% c("cg14480394","cg14440600","cg17968523","cg20727114")][order(mapinfo)]
+
+#tmp = ADM5[probe_id%in%markers2$probe_id]
+#tmp = merge(markers2[,.(probe_id,pval2=pval,phthalate)],tmp[,.(probe_id,pval,phthalate)])
+
+```
+
+
+## Analysis stratified by sex
+
+```{r, fig.width=5,fig.height=8}
+frml_strt = formula(cpg~sex+gestational_age+fenton_score+B+CD4+CD8+MO+GR+NK+nRBC+plate+row)
+
+STRT = pmap(ADM5,function(probe_id,phthalate,...){
+  frml = update(frml_strt,paste0("~.+sex:",phthalate))
+  prgs$cpg = beta[probe_id,]
+  m = lmrob(frml,prgs,control=lmrob.control(refine.tol=1e-4,setting="KS2014",seed=SEED))
+  coef(summary(m))[24:25,c(1,4)]
+}) %>% do.call("rbind",.)
+
+STRT = data.table(STRT,keep.rownames=TRUE)
+STRT[,sex:=stri_match(rn,regex="(female|male)")[,2]]
+STRT[,phthalate:=stri_match(rn,regex=":(.+)$")[,2]]
+STRT[,phthalate:=factor(phthalate,levels=c("BBzP","DEP","DiBP","DnBP","DEHP"))]
+STRT$rn = NULL
+setnames(STRT,c("Estimate","Pr(>|t|)"),c("effect","pval"))
+STRT$probe_id = rep(ADM5$probe_id,each=2)
+STRT = merge(STRT,ewastools:::manifest_epic[,.(probe_id,chr,mapinfo)],by="probe_id")
+
+p = ( ggplot(STRT)
++ geom_rect(aes(xmin=50191942,xmax=50194247,ymin=-Inf,ymax=Inf),fill="gray")
++ geom_hline(yintercept=0,color="gray")
++ geom_line (aes(x=mapinfo,y=effect,group=sex,color=sex))
++ geom_point(aes(x=mapinfo,y=effect,group=sex,color=sex,fill=sex))
++ xlab("Genomic coordinates")
++ ylab("β")
++ facet_wrap(vars(phthalate),scales="free_y",nrow=3,ncol=2)
++ scale_color_manual(values=c("female"="#DDAA33","male"="#004488"),aesthetics = c("colour", "fill"))
++ theme_few()
++ theme(axis.text.x = element_text(angle = 30, hjust = 1))
+)
+
+reposition_legend(p, 'center', panel='panel-2-3')
+```
